@@ -57,7 +57,7 @@ def plot_dividend(info: SimulatorInfo, rolling: int = 1, figsize=(6, 6)):
     plt.title('Stock Dividend') if rolling == 1 else plt.title(f'Stock Dividend (MA {rolling})')
     plt.xlabel('Iterations')
     plt.ylabel('Dividend')
-    plt.plot(range(rolling, len(info.dividends)), math.rolling(info.dividends, rolling), color='black')
+    plt.plot(range(rolling, len(info.dividends) + 1), math.rolling(info.dividends, rolling), color='black')
     plt.show()
 
 

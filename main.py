@@ -1,4 +1,5 @@
 from AgentBasedModel import *
+from AgentBasedModel.amms.amms import UniswapV2
 from AgentBasedModel.utils.math import *
 
 import itertools
@@ -22,8 +23,10 @@ after = list()
 for n_rand, n_fund, n_chart, n_univ in tqdm(list(itertools.product(RANGE, repeat=4))):
     for is_mm in range(2):
         exchange = ExchangeAgent(volume=1000)
+        amm = UniswapV2()
         simulator = Simulator(**{
             'exchange': exchange,
+            'amm': amm,
             'traders': [
                 *[Random(exchange, 10 ** 3) for _ in range(n_rand)],
                 *[Fundamentalist(exchange, 10 ** 3) for _ in range(n_fund)],
@@ -31,14 +34,19 @@ for n_rand, n_fund, n_chart, n_univ in tqdm(list(itertools.product(RANGE, repeat
                 *[Universalist(exchange, 10 ** 3) for _ in range(n_univ)],
                 *[MarketMaker(exchange, 10 ** 3) for _ in range(is_mm)]
             ],
+            'arbitrage_traders': [*[Arbitrage(exchange, 10**3, amm) for _ in range(5)]],
             'events': [MarketPriceShock(200, -10)]
         })
         info = simulator.info
         simulator.simulate(500, silent=True)
 
-        tmp = aggToShock(simulator, 1, FUNCS)['Market Price shock (it=200, dp=-10)']['price']
+        shock_key = str(simulator.events[0])
+        tmp = aggToShock(simulator, 1, FUNCS)[shock_key]['price']
 
         traders.append({'Random': n_rand, 'Fundamentalist': n_fund, 'Chartist': n_chart, 'Universalist': n_univ,
                         'MarketMaker': is_mm})
         before.append(tmp['right before'])
         after.append(tmp['after'])
+        plot_price(simulator.info, spread=False)
+        plot_dividend(simulator.info)
+        plot_volatility_price(simulator.info)

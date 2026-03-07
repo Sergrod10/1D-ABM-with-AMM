@@ -255,6 +255,33 @@ class OrderList:
 
         return order
 
+    def try_fulfill(self, order: Order):
+        """
+        Estimate match result for given order without changing order book or traders balances.
+
+        :return: tuple(filled_quantity, traded_value)
+        """
+        if order.order_type == self.order_type:
+            raise ValueError(f'Wrong order type! OrderList: {self.order_type}, Order: {order.order_type}')
+        if order.qty == 0:
+            return 0, 0
+        rem_qty = order.qty
+        filled_qty = 0
+        prices_sum = 0.0
+
+        for val in self:
+            if rem_qty == 0:
+                break
+            if val > order:
+                break
+            cur_qty = min(rem_qty, val.qty)
+            cur_value = val.price * cur_qty
+            rem_qty -= cur_qty
+            filled_qty += cur_qty
+            prices_sum += cur_value
+
+        return filled_qty, prices_sum
+
     @classmethod
     def from_list(cls, order_list, sort=False):
         order_list = [Order(order['price'], order['qty'], order['order_type'],

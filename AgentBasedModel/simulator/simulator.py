@@ -1,3 +1,5 @@
+from AgentBasedModel import Arbitrage
+from AgentBasedModel.amms import AMMAgent
 from AgentBasedModel.agents import ExchangeAgent, Universalist, Chartist, Fundamentalist
 from AgentBasedModel.utils.math import mean, std, difference, rolling
 import random
@@ -8,11 +10,21 @@ class Simulator:
     """
     Simulator is responsible for launching agents' actions and executing scenarios
     """
-    def __init__(self, exchange: ExchangeAgent = None, traders: list = None, events: list = None):
+    def __init__(self, exchange: ExchangeAgent = None, amm: AMMAgent = None, traders: list = None, arbitrage_traders: list = None, events: list = None):
+        """
+        :param exchange: central limit order book market agent
+        :param amm: AMM venue used for arbitrage, optional
+        :param traders: list of standard market traders
+        :param arbitrage_traders: list of arbitrage traders interacting with AMM
+        :param events: list of scenario events
+        """
         self.exchange = exchange
+        self.amm = amm
         self.events = [event.link(self) for event in events] if events else None  # link all events to simulator
         self.traders = traders
+        self.arbitrage_traders = arbitrage_traders
         self.info = SimulatorInfo(self.exchange, self.traders)  # links to existing objects
+        self.amm_info = AmmAgentInfo(self.amm, self.arbitrage_traders)
 
     def _payments(self):
         for trader in self.traders:
@@ -20,6 +32,13 @@ class Simulator:
             trader.cash += trader.assets * self.exchange.dividend()  # allow negative dividends
             # Interest payment
             trader.cash += trader.cash * self.exchange.risk_free  # allow risk-free loan
+
+        if self.amm is not None:
+            for trader in self.arbitrage_traders:
+                # Dividend payments
+                trader.cash += trader.assets * self.exchange.dividend()  # allow negative dividends
+                # Interest payment
+                trader.cash += trader.cash * self.exchange.risk_free  # allow risk-free loan
 
     def simulate(self, n_iter: int, silent=False) -> object:
         for it in tqdm(range(n_iter), desc='Simulation', disable=silent):
@@ -30,6 +49,8 @@ class Simulator:
 
             # Capture current info
             self.info.capture()
+            if self.amm is not None:
+                self.amm_info.capture()
 
             # Change behaviour
             for trader in self.traders:
@@ -42,6 +63,13 @@ class Simulator:
             random.shuffle(self.traders)
             for trader in self.traders:
                 trader.call()
+
+            if self.amm is not None:
+                random.shuffle(self.arbitrage_traders)
+                for trader in self.arbitrage_traders:
+                    trader.call()
+                self.amm_info.capture_queue()
+                self.amm.arbitrage_queue.simulate()
 
             # Payments and dividends
             self._payments()  # pay dividends
@@ -178,3 +206,67 @@ class SimulatorInfo:
         prices = self.prices
         liq = [spreads[i] / prices[i] for i in range(n)]
         return rolling(liq, roll) if roll else mean(liq)
+
+
+class AmmAgentInfo:
+    """
+    AmmAgentInfo captures AMM state, arbitrage queue state, and arbitrage trader state on each iteration.
+    """
+    def __init__(self, amm: AMMAgent = None, traders: list[Arbitrage] = None):
+        """
+        :param amm: AMM agent linked to simulator
+        :param traders: arbitrage traders linked to simulator
+        """
+        self.amm = amm
+        self.traders = {t.id: t for t in traders}
+
+        # AMM Statistics
+        self.equities_amm = list()
+        self.prices = list()
+        self.cash_amm = list()
+        self.assets_amm = list()
+        self.arbs_queue = list()
+
+        # Agent statistics
+        self.equities = list()  # agent: equity
+        self.cash_traders = list()  # agent: cash
+        self.assets_traders = list()  # agent: number of assets
+        self.participated = list()
+
+    def capture(self):
+        """
+        Capture AMM reserves/price and current arbitrage traders metrics.
+        """
+        # AMM Statistics
+        self.prices.append(self.amm.price())
+        self.cash_amm.append(self.amm.cash)
+        self.assets_amm.append(self.amm.asset)
+        self.equities_amm.append(self.amm.price() * self.amm.asset + self.amm.cash)
+        self.capture_queue()
+
+        # Trader Statistics
+        self.equities.append({t_id: t.equity() for t_id, t in self.traders.items()})
+        self.cash_traders.append({t_id: t.cash for t_id, t in self.traders.items()})
+        self.assets_traders.append({t_id: t.assets for t_id, t in self.traders.items()})
+        self.participated.append({t_id: (t.buy, t.sell) for t_id, t in self.traders.items()})
+
+    def capture_queue(self):
+        """
+        Store state of arbitrage queue on current iteration
+        """
+        current_orders = []
+        for order in self.amm.arbitrage_queue.arbitrage_list:
+            current_orders.append({
+                'order_id': order.order_id,
+                'order_type': order.order_type,
+                'qty': order.qty,
+                'min_got_cash': order.min_got_cash,
+                'pay_for_prio': order.pay_for_prio,
+                'trader_id': order.trader.id if order.trader is not None else None,
+                'trader_name': order.trader.name if order.trader is not None else None,
+            })
+
+        self.arbs_queue.append({
+            'quantity': len(current_orders),
+            'orders': current_orders,
+        })

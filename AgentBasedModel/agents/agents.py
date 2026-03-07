@@ -1,3 +1,6 @@
+from AgentBasedModel.amms.amms import AMMAgent, ArbitrageOrder
+import numpy as np
+
 from AgentBasedModel.utils import Order, OrderList
 from AgentBasedModel.utils.math import exp, mean
 import random
@@ -143,6 +146,18 @@ class ExchangeAgent:
             order = self.order_book['bid'].fulfill(order, t_cost)
         return order
 
+    def try_market_order(self, order: Order):
+        """
+        Estimate market order execution without changing order book state.
+
+        :return: tuple(filled_quantity, traded_value)
+        """
+        if order.order_type == 'bid':
+            compl, summ = self.order_book['ask'].try_fulfill(order)
+        else:
+            compl, summ = self.order_boo['bid'].try_fulfill(order)
+        return compl, summ
+
     def cancel_order(self, order: Order):
         """
         Cancel order from order book
@@ -203,6 +218,17 @@ class Trader:
         order = Order(self.market.order_book['ask'].last.price, round(quantity), 'bid', self)
         return self.market.market_order(order).qty
 
+    def _try_buy_market(self, quantity):
+        """
+        Estimate market buy execution without changing account balances and order book.
+
+        :return: tuple(filled_quantity, spent_cash_without_fees)
+        """
+        if not self.market.order_book['ask']:
+            return 0, 0
+        order = Order(self.market.order_book['ask'].last.price, round(quantity), 'bid', self)
+        return self.market.try_market_order(order)
+
     def _sell_market(self, quantity) -> int:
         """
         :return: quantity unfulfilled
@@ -212,10 +238,20 @@ class Trader:
         order = Order(self.market.order_book['bid'].last.price, round(quantity), 'ask', self)
         return self.market.market_order(order).qty
 
+    def _try_sell_market(self, quantity):
+        """
+        Estimate market sell execution without changing account balances and order book.
+
+        :return: tuple(filled_quantity, received_cash_without_fees)
+        """
+        if not self.market.order_book['bid']:
+            return 0, 0
+        order = Order(self.market.order_book['bid'].last.price, round(quantity), 'ask', self)
+        return self.market.try_market_order(order)
+
     def _cancel_order(self, order: Order):
         self.market.cancel_order(order)
         self.orders.remove(order)
-
 
 class Random(Trader):
     """
@@ -575,3 +611,120 @@ class MarketMaker(Trader):
             base_offset = -((spread['ask'] - spread['bid']) * (self.assets / self.softlimit))  # Price offset
             self._buy_limit(bid_volume, spread['bid'] - base_offset - .1)  # BID
             self._sell_limit(ask_volume, spread['ask'] + base_offset + .1)  # ASK
+
+class Arbitrage(Trader):
+    """
+    Arbitrage trader compares CEX and AMM quotes and submits profitable arbitrage requests to AMM queue.
+    """
+
+    def __init__(self, market: ExchangeAgent, cash: float or int, amm: AMMAgent, assets: int = 0, q_min: int = 1, q_max: int = 5):
+        """
+        :param market: exchange agent link
+        :param cash: amount of cash
+        :param amm: AMM agent used as second venue for arbitrage
+        :param assets: number of assets
+        :param q_min: minimal quantity per swap
+        :param q_max: maximal quantity per swap
+        """
+        super().__init__(market, cash, assets)
+        self.amm = amm
+        self.q_min = q_min
+        self.q_max = q_max
+        u = np.random.uniform(np.log(0.001), np.log(0.05))
+        self.slip_tollerance = np.exp(u)
+
+        self.buy = 0
+        self.sell = 0
+
+    def arbitrage_buy_cex_order(self, quantity, min_got_cash, pay_for_prio):
+        """
+        buy on CEX and sell on AMM.
+        """
+        self.amm.arbitrage_queue.add(ArbitrageOrder(quantity, min_got_cash, pay_for_prio, "buy", self))
+
+    def arbitrage_sell_cex_order(self, quantity, min_got_cash, pay_for_prio):
+        """
+        sell on CEX and buy on AMM.
+        """
+        self.amm.arbitrage_queue.add(ArbitrageOrder(quantity, min_got_cash, pay_for_prio, "sell", self))
+
+    def buy_market(self, quantity):
+        """
+        market buy on CEX.
+        """
+        return self._buy_market(quantity)
+
+    def sell_market(self, quantity):
+        """
+        market sell on CEX.
+        """
+        return self._sell_market(quantity)
+
+    def get_quotes_buy(self, q):
+        """
+        Estimate arbitrage leg prices for swap: buy on CEX, sell on AMM.
+        """
+        compl_q, sum_price = self._try_buy_market(q)
+        spent_cash = sum_price * (1 + self.market.transaction_cost)
+        got_cash = self.amm.try_sell(compl_q)
+        return compl_q, spent_cash, got_cash
+
+    def get_quotes_sell(self, q):
+        """
+        Estimate arbitrage leg prices for swap: sell on CEX, buy on AMM.
+        """
+        compl_q, got_cash = self._try_sell_market(q)
+        got_cash = got_cash * (1 - self.market.transaction_cost)
+        spent_cash = self.amm.try_buy(compl_q)
+        return compl_q, spent_cash, got_cash
+
+    def buy_profit(self, q):
+        """
+        Estimate expected profit for buying on cex and selling on dex
+        """
+        compl_q, spent_cash, got_cash = self.get_quotes_buy(q)
+        worst_case_cash = got_cash * (1 - self.slip_tollerance)
+        profit = got_cash - spent_cash - self.amm.gas_cost
+        u = np.random.uniform(np.log(0.001), np.log(0.5))
+        kap = np.exp(u)
+        pay_prio = profit * kap
+        worst_profit = worst_case_cash - spent_cash - self.amm.gas_cost - pay_prio
+        if worst_profit <= 0:
+            profit = 0
+        return compl_q, worst_case_cash, pay_prio, profit
+
+    def sell_profit(self, q):
+        """
+        Estimate expected profit for buying on dex and selling on cex
+        """
+        compl_q, spent_cash, got_cash = self.get_quotes_sell(q)
+        worst_case_cash = got_cash * (1 - self.slip_tollerance)
+        profit = got_cash - spent_cash - self.amm.gas_cost
+        u = np.random.uniform(np.log(0.001), np.log(0.5))
+        kap = np.exp(u)
+        pay_prio = profit * kap
+        worst_profit = worst_case_cash - spent_cash - self.amm.gas_cost - pay_prio
+        if worst_profit <= 0:
+            profit = 0
+        return compl_q, worst_case_cash, pay_prio, profit
+
+    def call(self):
+        """
+        Select most profitable direction and sending order if expected profit is positive.
+        """
+        q = random.randint(self.q_min, self.q_max)
+
+        # buy on cex sell on dex
+        q1, wc1, gfp1, prof1 = self.buy_profit(q)
+        q2, wc2, gfp2, prof2 = self.sell_profit(q)
+
+        eps = 10 ** (-5)
+        if max(prof1, prof2) <= eps:
+            return
+
+        if prof1 > prof2:
+            self.buy += 1
+            self.arbitrage_buy_cex_order(q1, wc1, gfp1)
+        else:
+            self.sell += 1
+            self.arbitrage_sell_cex_order(q2, wc2, gfp2)
