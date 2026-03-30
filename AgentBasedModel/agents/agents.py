@@ -14,7 +14,7 @@ class ExchangeAgent:
     id = 0
 
     def __init__(self, price: float or int = 100, std: float or int = 25, volume: int = 1000, rf: float = 5e-4,
-                 transaction_cost: float = 0):
+                 transaction_cost: float = 0, std_random: float or int = 2.5, divs_drifted: bool = False):
         """
         Initialization parameters
         :param price: stock initial price
@@ -30,6 +30,8 @@ class ExchangeAgent:
         self.dividend_book = list()  # list of future dividends
         self.risk_free = rf
         self.transaction_cost = transaction_cost
+        self.std_random = std_random
+        self.divs_drifted = divs_drifted
         self._fill_book(price, std, volume, rf * price)
 
     def generate_dividend(self):
@@ -46,13 +48,13 @@ class ExchangeAgent:
         Fill order book with random orders. Fill dividend book with n future dividends.
         """
         # Order book
-        prices1 = [round(random.normalvariate(price - std, std), 1) for _ in range(volume // 2)]
-        prices2 = [round(random.normalvariate(price + std, std), 1) for _ in range(volume // 2)]
+        prices1 = [random.normalvariate(price - std, std) for _ in range(volume // 2)]
+        prices2 = [random.normalvariate(price + std, std) for _ in range(volume // 2)]
         quantities = [random.randint(1, 5) for _ in range(volume)]
 
         for (p, q) in zip(sorted(prices1 + prices2), quantities):
             if p > price:
-                order = Order(round(p, 1), q, 'ask', None)
+                order = Order(p, q, 'ask', None)
                 self.order_book['ask'].append(order)
             else:
                 order = Order(p, q, 'bid', None)
@@ -93,7 +95,7 @@ class ExchangeAgent:
     def price(self) -> float or None:
         spread = self.spread()
         if spread:
-            return round((spread['bid'] + spread['ask']) / 2, 1)
+            return (spread['bid'] + spread['ask']) / 2
         raise Exception(f'Price cannot be determined, since no orders either bid or ask')
 
     def dividend(self, access: int = None) -> list or float:
@@ -105,9 +107,11 @@ class ExchangeAgent:
             return self.dividend_book[0]
         return self.dividend_book[:access]
 
-    @classmethod
-    def _next_dividend(cls, std=5e-3):
-        return exp(random.normalvariate(0, std))
+    # у меня промежуток маленький -> фундаментальная цена должна дрейофвать, а не расти -> матож должен быть 1 -> чуть поправил
+    def _next_dividend(self, std=5e-3):
+        if not self.divs_drifted:
+            return exp(random.normalvariate(0, std))
+        return exp(random.normalvariate(-(std**2)/2, std))
 
     def limit_order(self, order: Order):
         """
@@ -155,7 +159,7 @@ class ExchangeAgent:
         if order.order_type == 'bid':
             compl, summ = self.order_book['ask'].try_fulfill(order)
         else:
-            compl, summ = self.order_boo['bid'].try_fulfill(order)
+            compl, summ = self.order_book['bid'].try_fulfill(order)
         return compl, summ
 
     def cancel_order(self, order: Order):
@@ -196,16 +200,29 @@ class Trader:
         return f'{self.name} ({self.type})'
 
     def equity(self):
-        price = self.market.price() if self.market.price() is not None else 0
+        spread = self.market.spread()
+        if spread is not None:
+            price = (spread['bid'] + spread['ask']) / 2
+        else:
+            bid = self.market.order_book['bid'].first
+            ask = self.market.order_book['ask'].first
+            if bid is not None and ask is not None:
+                price = (bid.price + ask.price) / 2
+            elif bid is not None:
+                price = bid.price
+            elif ask is not None:
+                price = ask.price
+            else:
+                price = 0
         return self.cash + self.assets * price
 
     def _buy_limit(self, quantity, price):
-        order = Order(round(price, 1), round(quantity), 'bid', self)
+        order = Order(float(price), float(quantity), 'bid', self)
         self.orders.append(order)
         self.market.limit_order(order)
 
     def _sell_limit(self, quantity, price):
-        order = Order(round(price, 1), round(quantity), 'ask', self)
+        order = Order(float(price), float(quantity), 'ask', self)
         self.orders.append(order)
         self.market.limit_order(order)
 
@@ -215,7 +232,7 @@ class Trader:
         """
         if not self.market.order_book['ask']:
             return quantity
-        order = Order(self.market.order_book['ask'].last.price, round(quantity), 'bid', self)
+        order = Order(self.market.order_book['ask'].last.price, float(quantity), 'bid', self)
         return self.market.market_order(order).qty
 
     def _try_buy_market(self, quantity):
@@ -226,7 +243,7 @@ class Trader:
         """
         if not self.market.order_book['ask']:
             return 0, 0
-        order = Order(self.market.order_book['ask'].last.price, round(quantity), 'bid', self)
+        order = Order(self.market.order_book['ask'].last.price, float(quantity), 'bid', self)
         return self.market.try_market_order(order)
 
     def _sell_market(self, quantity) -> int:
@@ -235,7 +252,7 @@ class Trader:
         """
         if not self.market.order_book['bid']:
             return quantity
-        order = Order(self.market.order_book['bid'].last.price, round(quantity), 'ask', self)
+        order = Order(self.market.order_book['bid'].last.price, float(quantity), 'ask', self)
         return self.market.market_order(order).qty
 
     def _try_sell_market(self, quantity):
@@ -246,7 +263,7 @@ class Trader:
         """
         if not self.market.order_book['bid']:
             return 0, 0
-        order = Order(self.market.order_book['bid'].last.price, round(quantity), 'ask', self)
+        order = Order(self.market.order_book['bid'].last.price, float(quantity), 'ask', self)
         return self.market.try_market_order(order)
 
     def _cancel_order(self, order: Order):
@@ -262,13 +279,14 @@ class Random(Trader):
         self.type = 'Random'
 
     @staticmethod
-    def draw_delta(std: float or int = 2.5):
+    def draw_delta(std: float or int):
         lamb = 1 / std
         return random.expovariate(lamb)
 
     @staticmethod
-    def draw_price(order_type, spread: dict, std: float or int = 2.5) -> float:
+    def draw_price(order_type, spread: dict, std: float or int) -> float:
         """
+        Draw price for limit order of Noise Agent. The price is calculated as:
         Draw price for limit order of Noise Agent. The price is calculated as:
         1) 35% - within the spread - uniform distribution
         2) 65% - out of the spread - delta from best price is exponential distribution r.v.
@@ -296,7 +314,7 @@ class Random(Trader):
         :param b: maximal quantity
         :return: quantity for order
         """
-        return random.randint(a, b)
+        return random.uniform(a, b)
 
     def call(self):
         spread = self.market.spread()
@@ -321,7 +339,7 @@ class Random(Trader):
 
         # Limit order
         elif random_state > .5:
-            price = self.draw_price(order_type, spread)
+            price = self.draw_price(order_type, spread, self.market.std_random)
             quantity = self.draw_quantity()
             if order_type == 'bid':
                 self._buy_limit(quantity, price)
@@ -371,13 +389,13 @@ class Fundamentalist(Trader):
         return min(q, 5)
 
     def call(self):
-        pf = round(self.evaluate(self.market.dividend(self.access), self.market.risk_free), 1)  # fundamental price
-        p = self.market.price()
+        pf = self.evaluate(self.market.dividend(self.access), self.market.risk_free)  # fundamental price
         spread = self.market.spread()
         t_cost = self.market.transaction_cost
 
         if spread is None:
             return
+        p = (spread['bid'] + spread['ask']) / 2
 
         random_state = random.random()
         qty = Fundamentalist.draw_quantity(pf, p)  # quantity to buy
@@ -388,26 +406,26 @@ class Fundamentalist(Trader):
         if random_state > .45:
             random_state = random.random()
 
-            ask_t = round(spread['ask'] * (1 + t_cost), 1)
-            bid_t = round(spread['bid'] * (1 - t_cost), 1)
+            ask_t = spread['ask'] * (1 + t_cost)
+            bid_t = spread['bid'] * (1 - t_cost)
 
             if pf >= ask_t:
                 if random_state > .5:
                     self._buy_market(qty)
                 else:
-                    self._sell_limit(qty, (pf + Random.draw_delta()) * (1 + t_cost))
+                    self._buy_limit(qty, (pf - Random.draw_delta(self.market.std_random)) * (1 - t_cost))
 
             elif pf <= bid_t:
                 if random_state > .5:
                     self._sell_market(qty)
                 else:
-                    self._buy_limit(qty, (pf - Random.draw_delta()) * (1 - t_cost))
+                    self._sell_limit(qty, (pf + Random.draw_delta(self.market.std_random)) * (1 + t_cost))
 
             elif ask_t > pf > bid_t:
                 if random_state > .5:
-                    self._buy_limit(qty, (pf - Random.draw_delta()) * (1 - t_cost))
+                    self._buy_limit(qty, (pf - Random.draw_delta(self.market.std_random)) * (1 - t_cost))
                 else:
-                    self._sell_limit(qty, (pf + Random.draw_delta()) * (1 + t_cost))
+                    self._sell_limit(qty, (pf + Random.draw_delta(self.market.std_random)) * (1 + t_cost))
 
         # Cancel order
         else:
@@ -440,6 +458,8 @@ class Chartist(Trader):
         random_state = random.random()
         t_cost = self.market.transaction_cost
         spread = self.market.spread()
+        if spread is None:
+            return
 
         if self.sentiment == 'Optimistic':
             # Market order
@@ -447,7 +467,10 @@ class Chartist(Trader):
                 self._buy_market(Random.draw_quantity())
             # Limit order
             elif random_state > .5:
-                self._buy_limit(Random.draw_quantity(), Random.draw_price('bid', spread) * (1 - t_cost))
+                self._buy_limit(
+                    Random.draw_quantity(),
+                    Random.draw_price('bid', spread, self.market.std_random) * (1 - t_cost),
+                )
             # Cancel order
             elif random_state < .35:
                 if self.orders:
@@ -458,7 +481,10 @@ class Chartist(Trader):
                 self._sell_market(Random.draw_quantity())
             # Limit order
             elif random_state > .5:
-                self._sell_limit(Random.draw_quantity(), Random.draw_price('ask', spread) * (1 + t_cost))
+                self._sell_limit(
+                    Random.draw_quantity(),
+                    Random.draw_price('ask', spread, self.market.std_random) * (1 + t_cost),
+                )
             # Cancel order
             elif random_state < .35:
                 if self.orders:
@@ -478,8 +504,12 @@ class Chartist(Trader):
         n_optimistic = sum([tr_type == 'Optimistic' for tr_type in info.sentiments[-1].values()])
         n_pessimists = sum([tr_type == 'Pessimistic' for tr_type in info.sentiments[-1].values()])
 
+        spread = self.market.spread()
+        if spread is None:
+            return
+
         dp = info.prices[-1] - info.prices[-2] if len(info.prices) > 1 else 0  # price derivative
-        p = self.market.price()  # market price
+        p = (spread['bid'] + spread['ask']) / 2  # market price
         x = (n_optimistic - n_pessimists) / n_chartists
 
         U = a1 * x + a2 / v1 * dp / p
@@ -540,8 +570,12 @@ class Universalist(Fundamentalist, Chartist):
         n_optimistic = sum([tr.sentiment == 'Optimistic' for tr in info.traders.values() if tr.type == 'Chartist'])
         n_pessimists = sum([tr.sentiment == 'Pessimistic' for tr in info.traders.values() if tr.type == 'Chartist'])
 
+        spread = self.market.spread()
+        if spread is None:
+            return
+
         dp = info.prices[-1] - info.prices[-2] if len(info.prices) > 1 else 0  # price derivative
-        p = self.market.price()  # market price
+        p = (spread['bid'] + spread['ask']) / 2  # market price
         pf = self.evaluate(self.market.dividend(self.access), self.market.risk_free)  # fundamental price
         r = pf * self.market.risk_free  # expected dividend return
         R = mean(info.returns[-1].values())  # average return in economy
@@ -607,6 +641,9 @@ class MarketMaker(Trader):
             self._buy_market((self.ul + self.ll) / 2 - self.assets) if ask_volume is None else None
             self._sell_market(self.assets - (self.ul + self.ll) / 2) if bid_volume is None else None
         else:
+            spread = self.market.spread()
+            if spread is None:
+                return
             self.panic = False
             base_offset = -((spread['ask'] - spread['bid']) * (self.assets / self.softlimit))  # Price offset
             self._buy_limit(bid_volume, spread['bid'] - base_offset - .1)  # BID

@@ -4,19 +4,21 @@ from AgentBasedModel.agents import ExchangeAgent, Universalist, Chartist, Fundam
 from AgentBasedModel.utils.math import mean, std, difference, rolling
 import random
 from tqdm import tqdm
+import numpy as np
 
 
 class Simulator:
     """
     Simulator is responsible for launching agents' actions and executing scenarios
     """
-    def __init__(self, exchange: ExchangeAgent = None, amm: AMMAgent = None, traders: list = None, arbitrage_traders: list = None, events: list = None):
+    def __init__(self, exchange: ExchangeAgent = None, amm: AMMAgent = None, traders: list = None, arbitrage_traders: list = None, events: list = None, avg_traders=0, last_step=0, last_ret=0, noisy_level=0, norm_coef_lr=1):
         """
         :param exchange: central limit order book market agent
         :param amm: AMM venue used for arbitrage, optional
         :param traders: list of standard market traders
         :param arbitrage_traders: list of arbitrage traders interacting with AMM
         :param events: list of scenario events
+        :param traders_ratio: fraction of standard traders that trade on each tick (0..1)
         """
         self.exchange = exchange
         self.amm = amm
@@ -24,7 +26,14 @@ class Simulator:
         self.traders = traders
         self.arbitrage_traders = arbitrage_traders
         self.info = SimulatorInfo(self.exchange, self.traders)  # links to existing objects
-        self.amm_info = AmmAgentInfo(self.amm, self.arbitrage_traders)
+        self.ratios = []
+        self.avg_traders = avg_traders
+        self.last_step = last_step
+        self.last_ret = last_ret
+        self.noisy_level = noisy_level
+        self.norm_coef_lr = norm_coef_lr
+        if amm is not None:
+            self.amm_info = AmmAgentInfo(self.amm, self.arbitrage_traders)
 
     def _payments(self):
         for trader in self.traders:
@@ -39,6 +48,21 @@ class Simulator:
                 trader.cash += trader.assets * self.exchange.dividend()  # allow negative dividends
                 # Interest payment
                 trader.cash += trader.cash * self.exchange.risk_free  # allow risk-free loan
+
+    # генерация сколько агентов будет участвовать, зависит от среднего, ластового значения и ластовой доходности и стандартного шума
+    # ф-ией для получения процентов используется сигмоида, так как она как раз от 0 до 1, а также супер удобная для подбора параметров
+    def get_cur_traders_count(self):
+        coef1 = self.avg_traders
+        coef2 = 0
+        if len(self.ratios) > 0:
+            coef2 = self.last_step * (self.ratios[-1] - self.avg_traders)
+        coef3 = 0
+        if len(self.info.prices) > 1:
+            coef3 = self.last_ret * (abs(self.info.prices[-1] - self.info.prices[-2]) / self.info.prices[-2]) * self.norm_coef_lr
+        coef4 = self.noisy_level * np.random.normal(0.0, 1.0)
+        coef = coef1 + coef2 + coef3 + coef4
+        self.ratios.append(coef)
+        return 1 / (1 + np.exp(-coef))
 
     def simulate(self, n_iter: int, silent=False) -> object:
         for it in tqdm(range(n_iter), desc='Simulation', disable=silent):
@@ -61,7 +85,8 @@ class Simulator:
 
             # Call Traders
             random.shuffle(self.traders)
-            for trader in self.traders:
+            ratio = self.get_cur_traders_count()
+            for trader in self.traders[:max(1, round(ratio * len(self.traders)))]:
                 trader.call()
 
             if self.amm is not None:
@@ -139,8 +164,22 @@ class SimulatorInfo:
         - :class:`list[dict]` **types** --> each agent's type on each iteration
         """
         # Market Statistics
-        self.prices.append(self.exchange.price())
-        self.spreads.append((self.exchange.spread()))
+        spread = self.exchange.spread()
+        if spread is None:
+            bid = self.exchange.order_book['bid'].first
+            ask = self.exchange.order_book['ask'].first
+            if bid is not None:
+                fallback_price = bid.price
+            elif ask is not None:
+                fallback_price = ask.price
+            elif self.prices:
+                fallback_price = self.prices[-1]
+            else:
+                fallback_price = 100.0
+            spread = {'bid': fallback_price, 'ask': fallback_price}
+
+        self.prices.append((spread['bid'] + spread['ask']) / 2)
+        self.spreads.append(spread)
         self.dividends.append(self.exchange.dividend())
         self.orders.append({
             'quantity': {'bid': len(self.exchange.order_book['bid']), 'ask': len(self.exchange.order_book['ask'])},
